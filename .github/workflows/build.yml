@@ -160,7 +160,7 @@ jobs:
             if [ -z "$CANDIDATE" ]; then
               echo "No executable found in $BIN_DIR" >&2
               exit 1
-            fi
+            }
             exec "$CANDIDATE" "$@"
           fi
           EOF
