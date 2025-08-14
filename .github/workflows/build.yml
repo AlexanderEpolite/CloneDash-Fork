@@ -92,23 +92,48 @@ jobs:
           APPDIR=AppDir
           rm -rf "$APPDIR"
           mkdir -p "$APPDIR/usr/bin"
-          cp -r ./publish/linux/* "$APPDIR/usr/bin/"
+
+          # Start with publish output
+          cp -r ./publish/linux/* "$APPDIR/usr/bin/" || true
+
+          # Overlay any runtime assets that may not be included by publish (e.g., shaders)
+          # Use -n to avoid clobbering files that are already present from publish.
+          for d in "./CloneDash/bin/Release/net8.0" "./Nucleus.ModelEditor/bin/Release/net8.0"; do
+            if [ -d "$d" ]; then
+              cp -rn "$d"/* "$APPDIR/usr/bin/" 2>/dev/null || true
+            fi
+          done
+
+          # Make sure main binary is executable (some setups may lose +x)
+          [ -f "$APPDIR/usr/bin/CloneDash" ] && chmod +x "$APPDIR/usr/bin/CloneDash"
+          [ -f "$APPDIR/usr/bin/Clone Dash" ] && chmod +x "$APPDIR/usr/bin/Clone Dash"
+
+          # AppRun: set working directory to usr/bin so relative asset paths (e.g., shaders/) resolve
           cat > "$APPDIR/AppRun" << 'EOF'
           #!/bin/sh
           set -e
           HERE="$(dirname "$(readlink -f "$0")")"
-          MAIN_BIN="$HERE/usr/bin/Clone Dash"
-          if [ ! -x "$MAIN_BIN" ]; then
-            CANDIDATE="$(find "$HERE/usr/bin" -maxdepth 1 -type f -perm -111 | head -n1)"
+          BIN_DIR="$HERE/usr/bin"
+
+          # Run from the directory that contains the assets (e.g., shaders/)
+          cd "$BIN_DIR"
+
+          # Prefer well-known names, otherwise pick the first executable file
+          if [ -x "./CloneDash" ]; then
+            exec "./CloneDash" "$@"
+          elif [ -x "./Clone Dash" ]; then
+            exec "./Clone Dash" "$@"
+          else
+            CANDIDATE="$(find . -maxdepth 1 -type f -perm -111 | head -n1)"
             if [ -z "$CANDIDATE" ]; then
-              echo "No executable found in AppImage usr/bin" >&2
+              echo "No executable found in $BIN_DIR" >&2
               exit 1
             fi
-            MAIN_BIN="$CANDIDATE"
+            exec "$CANDIDATE" "$@"
           fi
-          exec "$MAIN_BIN" "$@"
           EOF
           chmod +x "$APPDIR/AppRun"
+
           cat > "$APPDIR/CloneDash.desktop" << 'EOF'
           [Desktop Entry]
           Type=Application
@@ -122,11 +147,15 @@ jobs:
           base64 -d > "$APPDIR/CloneDash.png" << 'EOF'
           iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAvoB9B9l60wAAAAASUVORK5CYII=
           EOF
-          curl -L -o appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          
+          curl -fsSL -o appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
           ./appimagetool-x86_64.AppImage --appimage-extract
           ARCH=x86_64 ./squashfs-root/AppRun "$APPDIR"
-          mv CloneDash-*.AppImage ./CloneDash-Game-Linux.AppImage || mv AppDir-*.AppImage ./CloneDash-Game-Linux.AppImage
+
+          # Normalize output filename
+          mv CloneDash-*.AppImage ./CloneDash-Game-Linux.AppImage 2>/dev/null || \
+          mv AppDir-*.AppImage ./CloneDash-Game-Linux.AppImage
 
       - name: Zip for Release (Linux)
         if: matrix.os == 'ubuntu-latest'
