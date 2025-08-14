@@ -92,39 +92,70 @@ jobs:
             cp -a "./Nucleus.ModelEditor/bin/Release/net8.0/." "$APPDIR/usr/bin/" || true
           fi
 
-          # Ensure main executable(s) are executable
-          [ -f "$APPDIR/usr/bin/CloneDash" ] && chmod +x "$APPDIR/usr/bin/CloneDash"
-          [ -f "$APPDIR/usr/bin/Clone Dash" ] && chmod +x "$APPDIR/usr/bin/Clone Dash"
+          # Ensure main executable(s) are executable when present
+          [ -f "$APPDIR/usr/bin/CloneDash" ] && chmod +x "$APPDIR/usr/bin/CloneDash" || true
+          [ -f "$APPDIR/usr/bin/Clone Dash" ] && chmod +x "$APPDIR/usr/bin/Clone Dash" || true
 
-          # Sanity: make sure mdlut.dat is available at runtime working dir
-          if [ ! -f "$APPDIR/usr/bin/mdlut.dat" ]; then
-            FOUND="$(find "$APPDIR/usr/bin" -type f -name 'mdlut.dat' | head -n1 || true)"
-            if [ -n "$FOUND" ]; then
-              cp -f "$FOUND" "$APPDIR/usr/bin/mdlut.dat"
-            else
-              echo "ERROR: mdlut.dat not found in AppImage payload (required by MuseDash compatibility)" >&2
-              echo "Listing nearby files for debugging:" >&2
-              (cd "$APPDIR/usr/bin" && find . -maxdepth 2 -type f | sort) || true
-              exit 1
-            fi
+          echo "== Listing key files in AppImage payload =="
+          (cd "$APPDIR/usr/bin" && ls -la | sed -n '1,200p') || true
+          echo "== Searching for mdlut.dat in payload =="
+          find "$APPDIR/usr/bin" -maxdepth 4 -type f -iname 'mdlut.dat' -printf '%p\n' || true
+
+          # Guarantee mdlut.dat presence in common lookup paths (root and compatibility folder)
+          MDLUT_SRC="$(find "$APPDIR/usr/bin" -maxdepth 6 -type f -iname 'mdlut.dat' | head -n1 || true)"
+          if [ -n "$MDLUT_SRC" ]; then
+            for dest in \
+              "$APPDIR/usr/bin/mdlut.dat" \
+              "$APPDIR/usr/bin/Compatibility/MuseDash/mdlut.dat" \
+              "$APPDIR/usr/bin/MuseDash/mdlut.dat"
+            do
+              mkdir -p "$(dirname "$dest")"
+              cp -f "$MDLUT_SRC" "$dest"
+            done
+          else
+            echo "WARNING: mdlut.dat not found in payload. If runtime requires it, app may fail." >&2
           fi
 
-          # AppRun: set working directory to usr/bin so relative asset paths resolve
+          # AppRun: set working directory to usr/bin so relative asset paths resolve,
+          # and copy mdlut.dat into XDG dirs if the app expects it there.
           cat > "$APPDIR/AppRun" << 'EOF'
           #!/bin/sh
           set -e
           HERE="$(dirname "$(readlink -f "$0")")"
           BIN_DIR="$HERE/usr/bin"
 
+          # Ensure native libs in usr/bin are discoverable
+          export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          # If mdlut.dat exists in payload, also stage it into standard XDG locations
+          # to satisfy apps that look in ~/.config/CloneDash or ~/.local/share/CloneDash.
+          MDLUT_SRC=""
+          if [ -f "$BIN_DIR/mdlut.dat" ]; then
+            MDLUT_SRC="$BIN_DIR/mdlut.dat"
+          else
+            # case-insensitive search within payload
+            MDLUT_SRC="$(find "$BIN_DIR" -maxdepth 4 -type f -iname 'mdlut.dat' | head -n1 || true)"
+          fi
+          if [ -n "$HOME" ] && [ -n "$MDLUT_SRC" ]; then
+            CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/CloneDash"
+            DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/CloneDash"
+            mkdir -p "$CONF_DIR" "$DATA_DIR" || true
+            [ ! -f "$CONF_DIR/mdlut.dat" ] && cp -f "$MDLUT_SRC" "$CONF_DIR/mdlut.dat" || true
+            [ ! -f "$DATA_DIR/mdlut.dat" ] && cp -f "$MDLUT_SRC" "$DATA_DIR/mdlut.dat" || true
+          fi
+
           # Run from the directory that contains the assets (e.g., shaders/, mdlut.dat)
           cd "$BIN_DIR"
 
-          # Prefer well-known names, otherwise pick the first executable file
+          # Prefer native host; otherwise use dotnet if only DLL is present
           if [ -x "./CloneDash" ]; then
             exec "./CloneDash" "$@"
           elif [ -x "./Clone Dash" ]; then
             exec "./Clone Dash" "$@"
+          elif [ -f "./CloneDash.dll" ]; then
+            exec dotnet "./CloneDash.dll" "$@"
           else
+            # Fallback: first executable file
             CANDIDATE="$(find . -maxdepth 1 -type f -perm -111 | head -n1)"
             if [ -z "$CANDIDATE" ]; then
               echo "No executable found in $BIN_DIR" >&2
