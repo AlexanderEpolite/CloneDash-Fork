@@ -75,7 +75,8 @@ jobs:
           Remove-Item -Recurse -Force $tempDir
 
       # Build AppImage directly from the same bin output as the working ZIP,
-      # ensuring parity of assets (e.g., shaders/, mdlut.dat, etc.)
+      # but run the app from a writable per-user directory at runtime so files like mdlut.dat
+      # can be created or found reliably.
       - name: Build AppImage (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -99,54 +100,51 @@ jobs:
           echo "== Listing key files in AppImage payload =="
           (cd "$APPDIR/usr/bin" && ls -la | sed -n '1,200p') || true
           echo "== Searching for mdlut.dat in payload =="
-          find "$APPDIR/usr/bin" -maxdepth 4 -type f -iname 'mdlut.dat' -printf '%p\n' || true
+          find "$APPDIR/usr/bin" -maxdepth 6 -type f -iname 'mdlut.dat' -printf '%p\n' || true
 
-          # Guarantee mdlut.dat presence in common lookup paths (root and compatibility folder)
-          MDLUT_SRC="$(find "$APPDIR/usr/bin" -maxdepth 6 -type f -iname 'mdlut.dat' | head -n1 || true)"
-          if [ -n "$MDLUT_SRC" ]; then
-            for dest in \
-              "$APPDIR/usr/bin/mdlut.dat" \
-              "$APPDIR/usr/bin/Compatibility/MuseDash/mdlut.dat" \
-              "$APPDIR/usr/bin/MuseDash/mdlut.dat"
-            do
-              mkdir -p "$(dirname "$dest")"
-              cp -f "$MDLUT_SRC" "$dest"
-            done
-          else
-            echo "WARNING: mdlut.dat not found in payload. If runtime requires it, app may fail." >&2
-          fi
-
-          # AppRun: set working directory to usr/bin so relative asset paths resolve,
-          # and copy mdlut.dat into XDG dirs if the app expects it there.
+          # AppRun: copy payload to a writable per-user dir and run from there.
+          # This avoids failures when the game tries to create or update files like mdlut.dat.
           cat > "$APPDIR/AppRun" << 'EOF'
           #!/bin/sh
-          set -e
+          set -eu
+
+          # Resolve payload dir inside the mounted AppImage
           HERE="$(dirname "$(readlink -f "$0")")"
-          BIN_DIR="$HERE/usr/bin"
+          PAYLOAD="$HERE/usr/bin"
 
           # Ensure native libs in usr/bin are discoverable
-          export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH="$PAYLOAD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-          # If mdlut.dat exists in payload, also stage it into standard XDG locations
-          # to satisfy apps that look in ~/.config/CloneDash or ~/.local/share/CloneDash.
-          MDLUT_SRC=""
-          if [ -f "$BIN_DIR/mdlut.dat" ]; then
-            MDLUT_SRC="$BIN_DIR/mdlut.dat"
+          # Choose a writable run dir for the user
+          APPNAME="CloneDash"
+          if [ -n "${HOME:-}" ]; then
+            DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+            RUN_DIR="$DATA_HOME/$APPNAME/AppImageRun"
           else
-            # case-insensitive search within payload
-            MDLUT_SRC="$(find "$BIN_DIR" -maxdepth 4 -type f -iname 'mdlut.dat' | head -n1 || true)"
+            # Fallback to /tmp if HOME is not set
+            RUN_DIR="/tmp/${APPNAME}-run"
           fi
-          if [ -n "$HOME" ] && [ -n "$MDLUT_SRC" ]; then
-            CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/CloneDash"
-            DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/CloneDash"
+          mkdir -p "$RUN_DIR"
+
+          # Sync payload into the writable run dir (idempotent)
+          # cp -a preserves permissions, times, symlinks
+          cp -a "$PAYLOAD/." "$RUN_DIR/"
+
+          # Quality-of-life: place/alias mdlut.dat in common lookup spots
+          if [ -f "$RUN_DIR/Compatibility/MuseDash/mdlut.dat" ] && [ ! -e "$RUN_DIR/mdlut.dat" ]; then
+            ln -sf "Compatibility/MuseDash/mdlut.dat" "$RUN_DIR/mdlut.dat"
+          fi
+          if [ -n "${HOME:-}" ] && [ -f "$RUN_DIR/mdlut.dat" ]; then
+            CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APPNAME"
+            DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APPNAME"
             mkdir -p "$CONF_DIR" "$DATA_DIR" || true
-            [ ! -f "$CONF_DIR/mdlut.dat" ] && cp -f "$MDLUT_SRC" "$CONF_DIR/mdlut.dat" || true
-            [ ! -f "$DATA_DIR/mdlut.dat" ] && cp -f "$MDLUT_SRC" "$DATA_DIR/mdlut.dat" || true
+            [ ! -f "$CONF_DIR/mdlut.dat" ] && cp -f "$RUN_DIR/mdlut.dat" "$CONF_DIR/mdlut.dat" || true
+            [ ! -f "$DATA_DIR/mdlut.dat" ] && cp -f "$RUN_DIR/mdlut.dat" "$DATA_DIR/mdlut.dat" || true
           fi
 
-          # Run from the directory that contains the assets (e.g., shaders/, mdlut.dat)
-          cd "$BIN_DIR"
-
+          # Run from the writable directory so relative asset paths and generated files work
+          cd "$RUN_DIR"
+          
           # Prefer native host; otherwise use dotnet if only DLL is present
           if [ -x "./CloneDash" ]; then
             exec "./CloneDash" "$@"
@@ -155,10 +153,9 @@ jobs:
           elif [ -f "./CloneDash.dll" ]; then
             exec dotnet "./CloneDash.dll" "$@"
           else
-            # Fallback: first executable file
-            CANDIDATE="$(find . -maxdepth 1 -type f -perm -111 | head -n1)"
+            CANDIDATE="$(find . -maxdepth 1 -type f -perm -111 | head -n1 || true)"
             if [ -z "$CANDIDATE" ]; then
-              echo "No executable found in $BIN_DIR" >&2
+              echo "No executable found in $RUN_DIR" >&2
               exit 1
             fi
             exec "$CANDIDATE" "$@"
