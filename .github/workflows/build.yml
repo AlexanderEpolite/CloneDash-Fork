@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
-
+      
       - name: Create Directory.Build.props to suppress NU1605
         shell: bash
         run: |
@@ -74,16 +74,8 @@ jobs:
           Compress-Archive -Path "$tempDir\*" -DestinationPath "./CloneDash-Game-Windows.zip" -Force
           Remove-Item -Recurse -Force $tempDir
 
-      - name: Publish Linux (framework-dependent) for AppImage
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          dotnet publish ./CloneDash \
-            -c Release \
-            -f net8.0 \
-            -p:SelfContained=false \
-            -p:RestoreNoWarn=NU1605 \
-            -o ./publish/linux
-
+      # Build AppImage directly from the same bin output as the working ZIP,
+      # ensuring parity of assets (e.g., shaders/, mdlut.dat, etc.)
       - name: Build AppImage (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -93,29 +85,38 @@ jobs:
           rm -rf "$APPDIR"
           mkdir -p "$APPDIR/usr/bin"
 
-          # Start with publish output
-          cp -r ./publish/linux/* "$APPDIR/usr/bin/" || true
+          # Copy exactly what the ZIP uses so assets match
+          cp -a "./CloneDash/bin/Release/net8.0/." "$APPDIR/usr/bin/"
+          # Include any shared/editor assets if they are used at runtime
+          if [ -d "./Nucleus.ModelEditor/bin/Release/net8.0" ]; then
+            cp -a "./Nucleus.ModelEditor/bin/Release/net8.0/." "$APPDIR/usr/bin/" || true
+          fi
 
-          # Overlay any runtime assets that may not be included by publish (e.g., shaders)
-          # Use -n to avoid clobbering files that are already present from publish.
-          for d in "./CloneDash/bin/Release/net8.0" "./Nucleus.ModelEditor/bin/Release/net8.0"; do
-            if [ -d "$d" ]; then
-              cp -rn "$d"/* "$APPDIR/usr/bin/" 2>/dev/null || true
-            fi
-          done
-
-          # Make sure main binary is executable (some setups may lose +x)
+          # Ensure main executable(s) are executable
           [ -f "$APPDIR/usr/bin/CloneDash" ] && chmod +x "$APPDIR/usr/bin/CloneDash"
           [ -f "$APPDIR/usr/bin/Clone Dash" ] && chmod +x "$APPDIR/usr/bin/Clone Dash"
 
-          # AppRun: set working directory to usr/bin so relative asset paths (e.g., shaders/) resolve
+          # Sanity: make sure mdlut.dat is available at runtime working dir
+          if [ ! -f "$APPDIR/usr/bin/mdlut.dat" ]; then
+            FOUND="$(find "$APPDIR/usr/bin" -type f -name 'mdlut.dat' | head -n1 || true)"
+            if [ -n "$FOUND" ]; then
+              cp -f "$FOUND" "$APPDIR/usr/bin/mdlut.dat"
+            else
+              echo "ERROR: mdlut.dat not found in AppImage payload (required by MuseDash compatibility)" >&2
+              echo "Listing nearby files for debugging:" >&2
+              (cd "$APPDIR/usr/bin" && find . -maxdepth 2 -type f | sort) || true
+              exit 1
+            fi
+          fi
+
+          # AppRun: set working directory to usr/bin so relative asset paths resolve
           cat > "$APPDIR/AppRun" << 'EOF'
           #!/bin/sh
           set -e
           HERE="$(dirname "$(readlink -f "$0")")"
           BIN_DIR="$HERE/usr/bin"
 
-          # Run from the directory that contains the assets (e.g., shaders/)
+          # Run from the directory that contains the assets (e.g., shaders/, mdlut.dat)
           cd "$BIN_DIR"
 
           # Prefer well-known names, otherwise pick the first executable file
@@ -144,10 +145,14 @@ jobs:
           Categories=Game;
           Terminal=false
           EOF
+
+          # Minimal placeholder icon
           base64 -d > "$APPDIR/CloneDash.png" << 'EOF'
           iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAvoB9B9l60wAAAAASUVORK5CYII=
           EOF
-          
+          ln -sf CloneDash.png "$APPDIR/.DirIcon"
+
+          # Build AppImage without requiring FUSE on the runner
           curl -fsSL -o appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
           ./appimagetool-x86_64.AppImage --appimage-extract
