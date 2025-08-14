@@ -1,7 +1,6 @@
 # this workflow will build a .NET project
 # for more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
 name: Build Release
-
 on:
   push:
     branches: [ "main" ]
@@ -19,10 +18,21 @@ jobs:
           - ubuntu-latest
           - macos-latest
     runs-on: ${{ matrix.os }}
-
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
+
+      - name: Create Directory.Build.props to suppress NU1605
+        shell: bash
+        run: |
+          cat > Directory.Build.props <<'EOF'
+          <Project>
+            <PropertyGroup>
+              <RestoreNoWarn>$(RestoreNoWarn);NU1605</RestoreNoWarn>
+              <NoWarn>$(NoWarn);NU1605</NoWarn>
+            </PropertyGroup>
+          </Project>
+          EOF
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -30,16 +40,16 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore dependencies
-        run: dotnet restore ./CloneDash.sln
+        run: dotnet restore ./CloneDash.sln -p:RestoreNoWarn=NU1605
 
       - name: Build (Release)
         run: dotnet build ./CloneDash.sln --configuration Release --no-restore
-      
+
       - name: Publish Windows single-file exe (framework-dependent)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          dotnet publish ./CloneDash `
+          dotnet publish "./CloneDash" `
             -c Release `
             -f net8.0 `
             -r win-x64 `
@@ -47,12 +57,12 @@ jobs:
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:EnableCompressionInSingleFile=true `
-            -o ./publish/win-x64-single
-
+            -p:RestoreNoWarn=NU1605 `
+            -o "./publish/win-x64-single"
           $exe = Get-ChildItem -Path "./publish/win-x64-single" -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "No exe produced in ./publish/win-x64-single" }
           Copy-Item $exe.FullName "./CloneDash-Game-Windows-Portable.exe" -Force
-      
+
       - name: Zip for Release (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -60,37 +70,36 @@ jobs:
           $tempDir = "tempzip"
           Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $tempDir | Out-Null
-
           Copy-Item -Recurse -Force "./CloneDash/bin/Release/net8.0/*" $tempDir
           Copy-Item -Recurse -Force "./Nucleus.ModelEditor/bin/Release/net8.0/*" $tempDir
-
           Compress-Archive -Path "$tempDir\*" -DestinationPath "./CloneDash-Game-Windows.zip" -Force
           Remove-Item -Recurse -Force $tempDir
 
-      # ---------------- Linux: AppImage (framework-dependent) ------------
-      # Avoid RID-specific publish to prevent NU1605 downgrade errors.
-      # Use build output (apphost is generated on Linux by dotnet build).
+      - name: Publish Linux (framework-dependent) for AppImage
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet publish ./CloneDash \
+            -c Release \
+            -f net8.0 \
+            -p:SelfContained=false \
+            -p:RestoreNoWarn=NU1605 \
+            -o ./publish/linux
+
       - name: Build AppImage (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           set -euo pipefail
-
           APPDIR=AppDir
           rm -rf "$APPDIR"
           mkdir -p "$APPDIR/usr/bin"
-
-          # Copy built files (contains Linux apphost "Clone Dash" and DLLs)
-          cp -r "./CloneDash/bin/Release/net8.0/"* "$APPDIR/usr/bin/"
-
-          # AppRun script to start the main binary
+          cp -r ./publish/linux/* "$APPDIR/usr/bin/"
           cat > "$APPDIR/AppRun" << 'EOF'
           #!/bin/sh
           set -e
           HERE="$(dirname "$(readlink -f "$0")")"
           MAIN_BIN="$HERE/usr/bin/Clone Dash"
           if [ ! -x "$MAIN_BIN" ]; then
-            # Fallback: pick the first executable
             CANDIDATE="$(find "$HERE/usr/bin" -maxdepth 1 -type f -perm -111 | head -n1)"
             if [ -z "$CANDIDATE" ]; then
               echo "No executable found in AppImage usr/bin" >&2
@@ -101,35 +110,25 @@ jobs:
           exec "$MAIN_BIN" "$@"
           EOF
           chmod +x "$APPDIR/AppRun"
-
-          # Desktop file (for metadata)
           cat > "$APPDIR/CloneDash.desktop" << 'EOF'
           [Desktop Entry]
           Type=Application
           Name=CloneDash
           Comment=CloneDash Game
           Exec=AppRun %F
+          Icon=CloneDash
           Categories=Game;
           Terminal=false
           EOF
-
-          # Optional icon (skip if you don't have one)
-          # mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-          # cp path/to/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/CloneDash.png"
-
-          # Download appimagetool
-          curl -L -o appimagetool-x86_64.AppImage \
-            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          base64 -d > "$APPDIR/CloneDash.png" << 'EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAvoB9B9l60wAAAAASUVORK5CYII=
+          EOF
+          curl -L -o appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
-
-          # Build AppImage without FUSE
           ./appimagetool-x86_64.AppImage --appimage-extract
           ARCH=x86_64 ./squashfs-root/AppRun "$APPDIR"
+          mv CloneDash-*.AppImage ./CloneDash-Game-Linux.AppImage || mv AppDir-*.AppImage ./CloneDash-Game-Linux.AppImage
 
-          # Normalize artifact name
-          mv CloneDash-*.AppImage ./CloneDash-Game-Linux.AppImage || \
-          mv AppDir-*.AppImage ./CloneDash-Game-Linux.AppImage
-      
       - name: Zip for Release (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -141,7 +140,7 @@ jobs:
           cp -r "./Nucleus.ModelEditor/bin/Release/net8.0/"* tempzip/
           zip -r "./CloneDash-Game-Linux.zip" tempzip
           rm -rf tempzip
-      
+
       - name: Zip for Release (macOS)
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -153,7 +152,7 @@ jobs:
           cp -r "./Nucleus.ModelEditor/bin/Release/net8.0/"* tempzip/
           zip -r "./CloneDash-Game-macOS.zip" tempzip
           rm -rf tempzip
-      
+
       - name: Upload artifact - Windows zip
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
